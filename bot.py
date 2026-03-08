@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import glob as globmod
+import json
 import logging
 import os
 import re
@@ -8,7 +9,10 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from hashlib import sha256
 from typing import Literal
 from uuid import uuid4
 
@@ -23,7 +27,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 INSTAGRAM_SESSION_ID = os.getenv("INSTAGRAM_SESSION_ID", "")
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB (Telegram limit)
 HOST = os.getenv("HOST", "0.0.0.0")
-PORT = os.getenv("PORT")
+PORT = int(os.getenv("PORT", "8080"))
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+ALLOW_POLLING = os.getenv("ALLOW_POLLING", "").strip().lower() in {"1", "true", "yes", "on"}
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
 COOKIES_FILE = None
 if INSTAGRAM_SESSION_ID:
@@ -54,6 +62,110 @@ URL_PATTERN = re.compile(
 def ensure_runtime_dependencies() -> None:
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is not available in PATH")
+
+
+def get_public_base_url() -> str | None:
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    if RAILWAY_PUBLIC_DOMAIN:
+        return f"https://{RAILWAY_PUBLIC_DOMAIN}"
+    return None
+
+
+def get_webhook_secret() -> str:
+    if WEBHOOK_SECRET:
+        return WEBHOOK_SECRET
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is required for webhook secret generation")
+    return sha256(BOT_TOKEN.encode("utf-8")).hexdigest()[:32]
+
+
+def get_webhook_path() -> str:
+    return f"/telegram-webhook/{get_webhook_secret()}"
+
+
+class TelegramWebhookHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
+class TelegramWebhookHandler(BaseHTTPRequestHandler):
+    application: Application = None
+    event_loop: asyncio.AbstractEventLoop = None
+    webhook_path: str = "/telegram-webhook"
+
+    def log_message(self, format: str, *args) -> None:
+        logger.info("HTTP %s - %s", self.address_string(), format % args)
+
+    def _send_response(
+        self,
+        status_code: int,
+        body: bytes,
+        content_type: str = "text/plain; charset=utf-8",
+    ) -> None:
+        self.send_response(status_code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        if self.path == "/health":
+            self._send_response(200, b"ok\n")
+            return
+        self._send_response(404, b"not found\n")
+
+    def do_POST(self) -> None:
+        if self.path != self.webhook_path:
+            self._send_response(404, b"not found\n")
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_response(400, b"invalid content length\n")
+            return
+
+        raw_body = self.rfile.read(content_length)
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self._send_response(400, b"invalid json\n")
+            return
+
+        self.event_loop.call_soon_threadsafe(
+            asyncio.create_task,
+            process_webhook_update(self.application, payload),
+        )
+        self._send_response(200, b"ok\n")
+
+
+async def process_webhook_update(application: Application, payload: dict) -> None:
+    try:
+        update = Update.de_json(payload, application.bot)
+        if update is None:
+            logger.warning("Received empty webhook payload")
+            return
+        await application.process_update(update)
+    except Exception:
+        logger.exception("Webhook update processing failed")
+
+
+def start_http_server(
+    loop: asyncio.AbstractEventLoop,
+    application: Application,
+    host: str,
+    port: int,
+    webhook_path: str,
+) -> tuple[TelegramWebhookHTTPServer, threading.Thread]:
+    handler_class = type("ConfiguredTelegramWebhookHandler", (TelegramWebhookHandler,), {})
+    handler_class.application = application
+    handler_class.event_loop = loop
+    handler_class.webhook_path = webhook_path
+
+    server = TelegramWebhookHTTPServer((host, port), handler_class)
+    thread = threading.Thread(target=server.serve_forever, daemon=True, name="telegram-webhook-http")
+    thread.start()
+    return server, thread
 
 
 def cleanup_pending_urls(bot_data: dict) -> None:
@@ -373,35 +485,51 @@ async def run() -> None:
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
+    public_base_url = get_public_base_url()
+    webhook_path = get_webhook_path()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, stop_event.set)
 
-    health_server = None
+    http_server = None
+    http_thread = None
 
     try:
         await app.initialize()
-        await app.bot.delete_webhook(drop_pending_updates=True)
         await app.start()
-        if app.updater is None:
-            raise RuntimeError("Telegram updater is unavailable")
-        await app.updater.start_polling(drop_pending_updates=True)
 
-        if PORT:
-            health_server = await asyncio.start_server(
-                handle_healthcheck,
+        if public_base_url:
+            http_server, http_thread = start_http_server(
+                loop=loop,
+                application=app,
                 host=HOST,
-                port=int(PORT),
+                port=PORT,
+                webhook_path=webhook_path,
             )
+            webhook_url = f"{public_base_url}{webhook_path}"
+            await app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+            logger.info("Webhook mode started: %s", webhook_url)
             logger.info("Healthcheck server started on %s:%s", HOST, PORT)
+        elif ALLOW_POLLING:
+            await app.bot.delete_webhook(drop_pending_updates=True)
+            if app.updater is None:
+                raise RuntimeError("Telegram updater is unavailable")
+            await app.updater.start_polling(drop_pending_updates=True)
+            logger.info("Polling mode started")
+        else:
+            raise RuntimeError(
+                "Local polling is disabled by default. "
+                "Set PUBLIC_BASE_URL for cloud webhook mode or ALLOW_POLLING=true for explicit local dev."
+            )
 
-        logger.info("Bot polling started")
         await stop_event.wait()
     finally:
-        if health_server is not None:
-            health_server.close()
-            await health_server.wait_closed()
+        if http_server is not None:
+            http_server.shutdown()
+            http_server.server_close()
+        if http_thread is not None:
+            http_thread.join(timeout=5)
 
         if app.updater is not None:
             with contextlib.suppress(Exception):
