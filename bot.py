@@ -8,11 +8,13 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import time
 from typing import Literal
+from uuid import uuid4
 
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters, ContextTypes
 import yt_dlp
 
 load_dotenv()
@@ -38,6 +40,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 MediaKind = Literal["video", "audio"]
+PENDING_URLS_KEY = "pending_urls"
+PENDING_URL_TTL_SECONDS = 60 * 60 * 6
 
 URL_PATTERN = re.compile(
     r"(https?://(?:www\.|m\.)?(?:"
@@ -50,6 +54,43 @@ URL_PATTERN = re.compile(
 def ensure_runtime_dependencies() -> None:
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is not available in PATH")
+
+
+def cleanup_pending_urls(bot_data: dict) -> None:
+    pending_urls = bot_data.setdefault(PENDING_URLS_KEY, {})
+    now = time.time()
+    expired_tokens = [
+        token for token, payload in pending_urls.items()
+        if now - payload.get("created_at", now) > PENDING_URL_TTL_SECONDS
+    ]
+    for token in expired_tokens:
+        pending_urls.pop(token, None)
+
+
+def store_pending_url(context: ContextTypes.DEFAULT_TYPE, url: str) -> str:
+    cleanup_pending_urls(context.bot_data)
+    pending_urls = context.bot_data.setdefault(PENDING_URLS_KEY, {})
+    token = uuid4().hex[:12]
+    pending_urls[token] = {"url": url, "created_at": time.time()}
+    return token
+
+
+def get_pending_url(context: ContextTypes.DEFAULT_TYPE, token: str) -> str | None:
+    cleanup_pending_urls(context.bot_data)
+    pending_urls = context.bot_data.setdefault(PENDING_URLS_KEY, {})
+    payload = pending_urls.get(token)
+    if not payload:
+        return None
+    return payload.get("url")
+
+
+def build_download_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("Видео", callback_data=f"download:video:{token}"),
+            InlineKeyboardButton("Аудио", callback_data=f"download:audio:{token}"),
+        ]]
+    )
 
 
 def extract_url(text: str) -> str | None:
@@ -75,16 +116,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🎼 Витесс, маэстро, этот бот создан специально для тебя! 🎹\n"
         "Получилось как подарок на 8 Марта 😂🎁\n\n"
         "Тут всё просто:\n"
-        "• кидаешь ссылку и получаешь видео 🎬\n"
-        "• отправляешь `/audio ссылка` и получаешь аудио 🎧\n\n"
+        "• кидаешь ссылку и выбираешь кнопкой: видео 🎬 или аудио 🎧\n"
+        "• если нужно, можно и командами: `/audio ссылка` или `/video ссылка`\n\n"
         "Никаких нот читать не надо, и даже дирижировать! 🎶✌️\n\n"
         "По всем вопросам: @shebalin000",
         parse_mode="Markdown",
     )
 
 
-async def send_video(update: Update, url: str) -> None:
-    status_msg = await update.message.reply_text("Скачиваю видео...")
+async def send_video(message: Message, url: str) -> None:
+    status_msg = await message.reply_text("Скачиваю видео...")
     file_path = None
     temp_dir = None
 
@@ -105,7 +146,7 @@ async def send_video(update: Update, url: str) -> None:
 
         await status_msg.edit_text("Отправляю видео...")
         with open(file_path, "rb") as media_file:
-            await update.message.reply_video(
+            await message.reply_video(
                 video=media_file,
                 supports_streaming=True,
                 read_timeout=120,
@@ -120,8 +161,8 @@ async def send_video(update: Update, url: str) -> None:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-async def send_audio(update: Update, url: str) -> None:
-    status_msg = await update.message.reply_text("Скачиваю аудио...")
+async def send_audio(message: Message, url: str) -> None:
+    status_msg = await message.reply_text("Скачиваю аудио...")
     file_path = None
     temp_dir = None
     title = None
@@ -143,7 +184,7 @@ async def send_audio(update: Update, url: str) -> None:
 
         await status_msg.edit_text("Отправляю аудио...")
         with open(file_path, "rb") as media_file:
-            await update.message.reply_audio(
+            await message.reply_audio(
                 audio=media_file,
                 title=title[:64] if title else None,
                 read_timeout=120,
@@ -168,7 +209,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    await send_video(update, url)
+    token = store_pending_url(context, url)
+    await update.message.reply_text(
+        "Выбери, что скачать:",
+        reply_markup=build_download_keyboard(token),
+    )
 
 
 async def handle_audio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -180,7 +225,7 @@ async def handle_audio_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    await send_audio(update, url)
+    await send_audio(update.message, url)
 
 
 async def handle_video_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -192,7 +237,37 @@ async def handle_video_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    await send_video(update, url)
+    await send_video(update.message, url)
+
+
+async def handle_download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None or query.message is None or query.data is None:
+        return
+
+    parts = query.data.split(":")
+    if len(parts) != 3 or parts[0] != "download":
+        await query.answer()
+        return
+
+    media_kind = parts[1]
+    token = parts[2]
+    url = get_pending_url(context, token)
+
+    if media_kind not in {"video", "audio"}:
+        await query.answer("Неизвестный формат", show_alert=True)
+        return
+
+    if not url:
+        await query.answer("Кнопка устарела. Пришли ссылку еще раз.", show_alert=True)
+        return
+
+    await query.answer("Начинаю загрузку...")
+
+    if media_kind == "audio":
+        await send_audio(query.message, url)
+    else:
+        await send_video(query.message, url)
 
 
 async def download_media(url: str, media_kind: MediaKind) -> tuple[str, str, str | None]:
@@ -294,6 +369,7 @@ async def run() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("audio", handle_audio_command))
     app.add_handler(CommandHandler("video", handle_video_command))
+    app.add_handler(CallbackQueryHandler(handle_download_callback, pattern=r"^download:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     stop_event = asyncio.Event()
