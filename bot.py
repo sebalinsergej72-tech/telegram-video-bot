@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+from typing import Literal
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -36,6 +37,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+MediaKind = Literal["video", "audio"]
+
 URL_PATTERN = re.compile(
     r"(https?://(?:www\.|m\.)?(?:"
     r"youtube\.com/watch\S*|youtu\.be/\S+|youtube\.com/shorts/\S+"  # YouTube
@@ -49,42 +52,52 @@ def ensure_runtime_dependencies() -> None:
         raise RuntimeError("ffmpeg is not available in PATH")
 
 
+def extract_url(text: str) -> str | None:
+    match = URL_PATTERN.search(text)
+    return match.group(1) if match else None
+
+
+def get_request_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    command_text = " ".join(context.args).strip()
+    if command_text:
+        return extract_url(command_text)
+
+    replied_message = update.message.reply_to_message if update.message else None
+    if replied_message and replied_message.text:
+        return extract_url(replied_message.text)
+
+    current_text = update.message.text if update.message and update.message.text else ""
+    return extract_url(current_text)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🎼 Витесс, маэстро, этот бот создан специально для тебя! 🎹\n"
         "Получилось как подарок на 8 Марта, ахах 😂🎁\n\n"
-        "Тут всё просто — кидаешь ссылку из YouTube или Instagram, "
-        "получаешь видео 🎬\n"
+        "Тут всё просто:\n"
+        "• кидаешь ссылку и получаешь видео 🎬\n"
+        "• отправляешь `/audio ссылка` и получаешь аудио 🎧\n\n"
         "Никаких нот читать не надо, и даже дирижировать! 🎶✌️\n\n"
         "По всем вопросам: @shebalin000"
+        ,
+        parse_mode="Markdown",
     )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text or ""
-    match = URL_PATTERN.search(text)
-
-    if not match:
-        await update.message.reply_text(
-            "Отправь мне ссылку на видео из YouTube или Instagram."
-        )
-        return
-
-    url = match.group(1)
+async def send_video(update: Update, url: str) -> None:
     status_msg = await update.message.reply_text("Скачиваю видео...")
-
-    video_path = None
+    file_path = None
     temp_dir = None
 
     try:
-        video_path, temp_dir = await download_video(url)
+        file_path, temp_dir, _ = await download_media(url, media_kind="video")
     except Exception as e:
-        logger.error("Download error: %s", e)
-        await status_msg.edit_text(f"Ошибка при скачивании: {e}")
+        logger.error("Video download error: %s", e)
+        await status_msg.edit_text(f"Ошибка при скачивании видео: {e}")
         return
 
     try:
-        file_size = os.path.getsize(video_path)
+        file_size = os.path.getsize(file_path)
         if file_size > MAX_FILE_SIZE:
             await status_msg.edit_text(
                 "Видео слишком большое (больше 50 МБ) для отправки через Telegram."
@@ -92,68 +105,162 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         await status_msg.edit_text("Отправляю видео...")
-        with open(video_path, "rb") as video_file:
+        with open(file_path, "rb") as media_file:
             await update.message.reply_video(
-                video=video_file,
+                video=media_file,
                 supports_streaming=True,
                 read_timeout=120,
                 write_timeout=120,
             )
         await status_msg.delete()
     except Exception as e:
-        logger.error("Send error: %s", e)
-        await status_msg.edit_text(f"Ошибка при отправке: {e}")
+        logger.error("Video send error: %s", e)
+        await status_msg.edit_text(f"Ошибка при отправке видео: {e}")
     finally:
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-async def download_video(url: str) -> tuple[str, str]:
+async def send_audio(update: Update, url: str) -> None:
+    status_msg = await update.message.reply_text("Скачиваю аудио...")
+    file_path = None
+    temp_dir = None
+    title = None
+
+    try:
+        file_path, temp_dir, title = await download_media(url, media_kind="audio")
+    except Exception as e:
+        logger.error("Audio download error: %s", e)
+        await status_msg.edit_text(f"Ошибка при скачивании аудио: {e}")
+        return
+
+    try:
+        file_size = os.path.getsize(file_path)
+        if file_size > MAX_FILE_SIZE:
+            await status_msg.edit_text(
+                "Аудио слишком большое (больше 50 МБ) для отправки через Telegram."
+            )
+            return
+
+        await status_msg.edit_text("Отправляю аудио...")
+        with open(file_path, "rb") as media_file:
+            await update.message.reply_audio(
+                audio=media_file,
+                title=title[:64] if title else None,
+                read_timeout=120,
+                write_timeout=120,
+            )
+        await status_msg.delete()
+    except Exception as e:
+        logger.error("Audio send error: %s", e)
+        await status_msg.edit_text(f"Ошибка при отправке аудио: {e}")
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text or ""
+    url = extract_url(text)
+
+    if not url:
+        await update.message.reply_text(
+            "Отправь мне ссылку на видео из YouTube или Instagram."
+        )
+        return
+
+    await send_video(update, url)
+
+
+async def handle_audio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    url = get_request_url(update, context)
+    if not url:
+        await update.message.reply_text(
+            "Отправь команду в формате `/audio ссылка` или ответь `/audio` на сообщение со ссылкой.",
+            parse_mode="Markdown",
+        )
+        return
+
+    await send_audio(update, url)
+
+
+async def handle_video_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    url = get_request_url(update, context)
+    if not url:
+        await update.message.reply_text(
+            "Отправь команду в формате `/video ссылка` или просто пришли ссылку сообщением.",
+            parse_mode="Markdown",
+        )
+        return
+
+    await send_video(update, url)
+
+
+async def download_media(url: str, media_kind: MediaKind) -> tuple[str, str, str | None]:
     tmp_dir = tempfile.mkdtemp(prefix="telegram-video-bot-")
-    output_path = os.path.join(tmp_dir, "video.%(ext)s")
+    prefix = "video" if media_kind == "video" else "audio"
+    output_path = os.path.join(tmp_dir, f"{prefix}.%(ext)s")
 
     ydl_opts = {
-        "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
         "outtmpl": output_path,
-        "merge_output_format": "mkv",
         "ignoreerrors": True,
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 30,
     }
+
+    if media_kind == "video":
+        ydl_opts["format"] = "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
+        ydl_opts["merge_output_format"] = "mkv"
+    else:
+        ydl_opts["format"] = "bestaudio/best"
+
     if COOKIES_FILE:
         ydl_opts["cookiefile"] = COOKIES_FILE
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.extract_info(url, download=True)
+        info = ydl.extract_info(url, download=True)
+
+    title = None
+    if isinstance(info, dict):
+        title = info.get("title")
 
     # Find the downloaded file (skip .part files)
-    files = [f for f in globmod.glob(os.path.join(tmp_dir, "video.*")) if not f.endswith(".part")]
+    files = [f for f in globmod.glob(os.path.join(tmp_dir, f"{prefix}.*")) if not f.endswith(".part")]
     if not files:
         raise FileNotFoundError("Не удалось найти скачанный файл")
     downloaded = files[0]
 
-    # Re-encode to H.264 mp4 with ffmpeg
-    final_path = os.path.join(tmp_dir, "output.mp4")
-    cmd = [
-        "ffmpeg", "-i", downloaded,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "28",
-        "-c:a", "aac", "-b:a", "128k",
-        "-pix_fmt", "yuv420p",
-        "-maxrate", "2M", "-bufsize", "4M",
-        "-movflags", "+faststart",
-        "-y", final_path,
-    ]
+    if media_kind == "video":
+        final_path = os.path.join(tmp_dir, "output.mp4")
+        cmd = [
+            "ffmpeg", "-i", downloaded,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "28",
+            "-c:a", "aac", "-b:a", "128k",
+            "-pix_fmt", "yuv420p",
+            "-maxrate", "2M", "-bufsize", "4M",
+            "-movflags", "+faststart",
+            "-y", final_path,
+        ]
+    else:
+        final_path = os.path.join(tmp_dir, "output.mp3")
+        cmd = [
+            "ffmpeg", "-i", downloaded,
+            "-vn",
+            "-c:a", "libmp3lame", "-b:a", "192k",
+            "-y", final_path,
+        ]
+
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     await proc.wait()
 
     if proc.returncode != 0 or not os.path.exists(final_path):
-        raise RuntimeError("Ошибка при конвертации видео")
+        raise RuntimeError("Ошибка при конвертации медиа")
 
     os.remove(downloaded)
-    return final_path, tmp_dir
+    return final_path, tmp_dir, title
 
 
 async def handle_healthcheck(
@@ -186,6 +293,8 @@ async def run() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("audio", handle_audio_command))
+    app.add_handler(CommandHandler("video", handle_video_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     stop_event = asyncio.Event()
