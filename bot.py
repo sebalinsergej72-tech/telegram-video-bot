@@ -73,13 +73,12 @@ def get_request_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str |
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🎼 Витесс, маэстро, этот бот создан специально для тебя! 🎹\n"
-        "Получилось как подарок на 8 Марта, ахах 😂🎁\n\n"
+        "Получилось как подарок на 8 Марта 😂🎁\n\n"
         "Тут всё просто:\n"
         "• кидаешь ссылку и получаешь видео 🎬\n"
         "• отправляешь `/audio ссылка` и получаешь аудио 🎧\n\n"
         "Никаких нот читать не надо, и даже дирижировать! 🎶✌️\n\n"
-        "По всем вопросам: @shebalin000"
-        ,
+        "По всем вопросам: @shebalin000",
         parse_mode="Markdown",
     )
 
