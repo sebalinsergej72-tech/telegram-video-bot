@@ -210,6 +210,10 @@ def extract_url(text: str) -> str | None:
     return match.group(1) if match else None
 
 
+def is_instagram_url(url: str) -> bool:
+    return "instagram.com/" in url
+
+
 def get_request_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
     command_text = " ".join(context.args).strip()
     if command_text:
@@ -395,8 +399,14 @@ async def download_media(url: str, media_kind: MediaKind) -> tuple[str, str, str
     }
 
     if media_kind == "video":
-        ydl_opts["format"] = "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
-        ydl_opts["merge_output_format"] = "mkv"
+        if is_instagram_url(url):
+            # Instagram often exposes a progressive MP4 with the correct canvas/metadata.
+            # Prefer that over DASH video+audio to avoid aspect-ratio issues.
+            ydl_opts["format"] = "best[ext=mp4][height<=720]/best[height<=720]/best"
+            ydl_opts["merge_output_format"] = "mp4"
+        else:
+            ydl_opts["format"] = "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
+            ydl_opts["merge_output_format"] = "mkv"
     else:
         ydl_opts["format"] = "bestaudio/best"
 
@@ -418,8 +428,30 @@ async def download_media(url: str, media_kind: MediaKind) -> tuple[str, str, str
 
     if media_kind == "video":
         final_path = os.path.join(tmp_dir, "output.mp4")
+        remux_cmd = [
+            "ffmpeg", "-i", downloaded,
+            "-map", "0:v:0", "-map", "0:a?",
+            "-c", "copy",
+            "-movflags", "+faststart",
+            "-y", final_path,
+        ]
+        remux_proc = await asyncio.create_subprocess_exec(
+            *remux_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        await remux_proc.wait()
+
+        if remux_proc.returncode == 0 and os.path.exists(final_path):
+            os.remove(downloaded)
+            return final_path, tmp_dir, title
+
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(final_path)
+
         cmd = [
             "ffmpeg", "-i", downloaded,
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1",
             "-c:v", "libx264", "-preset", "fast", "-crf", "28",
             "-c:a", "aac", "-b:a", "128k",
             "-pix_fmt", "yuv420p",
