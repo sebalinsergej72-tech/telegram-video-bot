@@ -214,6 +214,43 @@ def is_instagram_url(url: str) -> bool:
     return "instagram.com/" in url
 
 
+def probe_video_metadata(file_path: str) -> tuple[int | None, int | None, int | None]:
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height:format=duration",
+            "-of", "json",
+            file_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    if probe.returncode != 0:
+        return None, None, None
+
+    try:
+        payload = json.loads(probe.stdout)
+    except json.JSONDecodeError:
+        return None, None, None
+
+    streams = payload.get("streams") or []
+    stream = streams[0] if streams else {}
+    width = stream.get("width")
+    height = stream.get("height")
+
+    duration = None
+    format_data = payload.get("format") or {}
+    raw_duration = format_data.get("duration")
+    if raw_duration is not None:
+        with contextlib.suppress(TypeError, ValueError):
+            duration = int(round(float(raw_duration)))
+
+    return width, height, duration
+
+
 def get_request_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
     command_text = " ".join(context.args).strip()
     if command_text:
@@ -259,10 +296,14 @@ async def send_video(message: Message, url: str) -> None:
             )
             return
 
+        width, height, duration = probe_video_metadata(file_path)
         await status_msg.edit_text("Отправляю видео...")
         with open(file_path, "rb") as media_file:
             await message.reply_video(
                 video=media_file,
+                width=width,
+                height=height,
+                duration=duration,
                 supports_streaming=True,
                 read_timeout=120,
                 write_timeout=120,
