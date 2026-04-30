@@ -32,6 +32,21 @@ jobs:
         run: |
           set -euo pipefail
 
+          for candidate in \
+            "https://invidious.nerdvpn.de/watch?v=kciEjgWCeXA&listen=true&local=true&raw=1" \
+            "https://inv.thepixora.com/watch?v=kciEjgWCeXA&listen=true&local=true&raw=1" \
+            "https://yt.chocolatemoo53.com/watch?v=kciEjgWCeXA&listen=true&local=true&raw=1"
+          do
+            rm -f output-source.bin
+
+            if timeout 180 curl -fL --retry 2 --retry-delay 2 -A "Mozilla/5.0" -o output-source.bin "$candidate"; then
+              if ffprobe -v error output-source.bin >/dev/null 2>&1; then
+                ffmpeg -y -i output-source.bin -vn -codec:a libmp3lame -q:a 0 output.mp3
+                exit 0
+              fi
+            fi
+          done
+
           if timeout 180 python <<'PY'
           import os
           import sys
