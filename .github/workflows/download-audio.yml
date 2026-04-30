@@ -160,7 +160,7 @@ jobs:
           from pathlib import Path
           from pytubefix import YouTube
 
-          yt = YouTube("https://youtu.be/kciEjgWCeXA?si=fB1GenKGLLOsN7Q4")
+          yt = YouTube("https://youtu.be/kciEjgWCeXA?si=fB1GenKGLLOsN7Q4", "WEB")
           stream = (
               yt.streams
               .filter(only_audio=True)
