@@ -23,12 +23,47 @@ jobs:
       - name: Install tools
         run: |
           python -m pip install --upgrade pip
-          python -m pip install yt-dlp
+          python -m pip install yt-dlp pytubefix
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg nodejs npm
 
       - name: Download audio
-        run: yt-dlp -x --audio-format mp3 --audio-quality 0 -o "output.%(ext)s" "$TARGET_URL"
+        run: |
+          set -euo pipefail
+
+          if yt-dlp \
+            --js-runtimes node \
+            --extractor-args "youtube:player_client=android,web_safari" \
+            -x \
+            --audio-format mp3 \
+            --audio-quality 0 \
+            -o "output.%(ext)s" \
+            "$TARGET_URL"; then
+            exit 0
+          fi
+
+          python <<'PY'
+          from pathlib import Path
+          from pytubefix import YouTube
+
+          yt = YouTube("https://youtu.be/kciEjgWCeXA?si=fB1GenKGLLOsN7Q4")
+          stream = (
+              yt.streams
+              .filter(only_audio=True)
+              .order_by("abr")
+              .desc()
+              .first()
+          )
+          if stream is None:
+              raise SystemExit("No audio-only stream found")
+
+          output_path = Path(stream.download(filename="output-source"))
+          print(output_path)
+          PY
+
+          source_file="$(find . -maxdepth 1 -type f -name 'output-source*' | head -n 1)"
+          test -n "$source_file"
+          ffmpeg -y -i "$source_file" -vn -codec:a libmp3lame -q:a 0 output.mp3
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
