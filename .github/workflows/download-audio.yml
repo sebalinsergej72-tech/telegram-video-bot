@@ -9,6 +9,7 @@ on:
 jobs:
   download:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     env:
       TARGET_URL: https://youtu.be/kciEjgWCeXA?si=fB1GenKGLLOsN7Q4
     steps:
@@ -23,7 +24,7 @@ jobs:
       - name: Install tools
         run: |
           python -m pip install --upgrade pip
-          python -m pip install yt-dlp pytubefix
+          python -m pip install requests yt-dlp pytubefix
           sudo apt-get update
           sudo apt-get install -y ffmpeg nodejs npm
 
@@ -31,7 +32,105 @@ jobs:
         run: |
           set -euo pipefail
 
-          if yt-dlp \
+          if timeout 180 python <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          import requests
+
+          target_url = os.environ["TARGET_URL"]
+          session = requests.Session()
+          session.headers.update(
+              {
+                  "User-Agent": "codex-audio-downloader/1.0 (+https://github.com/sebalinsergej72-tech/telegram-video-bot)",
+                  "Accept": "application/json",
+              }
+          )
+
+          instances = session.get(
+              "https://instances.cobalt.best/api/instances.json",
+              timeout=20,
+          ).json()
+
+          for instance in instances:
+              if instance.get("protocol") != "https":
+                  continue
+              services = instance.get("services") or {}
+              if services.get("youtube") is not True:
+                  continue
+
+              base_url = f"https://{instance['api']}"
+              try:
+                  info = session.get(base_url, timeout=10).json()
+              except Exception:
+                  continue
+
+              if info.get("cobalt", {}).get("turnstileSitekey"):
+                  continue
+
+              try:
+                  response = session.post(
+                      f"{base_url}/",
+                      json={
+                          "url": target_url,
+                          "downloadMode": "audio",
+                          "audioFormat": "mp3",
+                          "audioBitrate": "320",
+                          "youtubeBetterAudio": True,
+                          "alwaysProxy": True,
+                          "filenameStyle": "pretty",
+                      },
+                      headers={"Content-Type": "application/json"},
+                      timeout=60,
+                  )
+                  payload = response.json()
+              except Exception:
+                  continue
+
+              status = payload.get("status")
+              if status == "error":
+                  continue
+
+              if status in {"tunnel", "redirect"}:
+                  file_url = payload["url"]
+                  filename = payload.get("filename", "output-source.mp3")
+              elif status == "local-processing":
+                  tunnels = payload.get("tunnel") or []
+                  if not tunnels:
+                      continue
+                  file_url = tunnels[0]
+                  filename = (payload.get("output") or {}).get("filename", "output-source.bin")
+              else:
+                  continue
+
+              suffix = Path(filename).suffix or ".bin"
+              output_path = Path(f"output-source{suffix}")
+              with session.get(file_url, stream=True, timeout=180) as download_response:
+                  download_response.raise_for_status()
+                  with output_path.open("wb") as output_file:
+                      for chunk in download_response.iter_content(chunk_size=1024 * 256):
+                          if chunk:
+                              output_file.write(chunk)
+
+              print(f"Downloaded via {base_url} to {output_path}")
+              sys.exit(0)
+
+          raise SystemExit("No public cobalt instance succeeded")
+          PY
+          then
+            if [ -f output-source.mp3 ]; then
+              mv output-source.mp3 output.mp3
+              exit 0
+            fi
+
+            source_file="$(find . -maxdepth 1 -type f -name 'output-source*' | head -n 1)"
+            test -n "$source_file"
+            ffmpeg -y -i "$source_file" -vn -codec:a libmp3lame -q:a 0 output.mp3
+            exit 0
+          fi
+
+          if timeout 180 yt-dlp \
             --js-runtimes node \
             --extractor-args "youtube:player_client=android,web_safari" \
             -x \
@@ -42,7 +141,7 @@ jobs:
             exit 0
           fi
 
-          python <<'PY'
+          timeout 180 python <<'PY'
           from pathlib import Path
           from pytubefix import YouTube
 
