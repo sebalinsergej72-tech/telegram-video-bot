@@ -46,10 +46,15 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
 MediaKind = Literal["video", "audio"]
 PENDING_URLS_KEY = "pending_urls"
 PENDING_URL_TTL_SECONDS = 60 * 60 * 6
+MEDIA_CACHE_KEY = "media_cache"
+MEDIA_CACHE_TTL_SECONDS = 60 * 60 * 24 * 7
 
 URL_PATTERN = re.compile(
     r"(https?://(?:www\.|m\.)?(?:"
@@ -88,12 +93,28 @@ class TelegramWebhookHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
+class SilentYTDLPLogger:
+    def debug(self, msg: str) -> None:
+        return
+
+    def info(self, msg: str) -> None:
+        return
+
+    def warning(self, msg: str) -> None:
+        return
+
+    def error(self, msg: str) -> None:
+        return
+
+
 class TelegramWebhookHandler(BaseHTTPRequestHandler):
     application: Application = None
     event_loop: asyncio.AbstractEventLoop = None
     webhook_path: str = "/telegram-webhook"
 
     def log_message(self, format: str, *args) -> None:
+        if self.path in {"/", "/health", "/favicon.ico"}:
+            return
         logger.info("HTTP %s - %s", self.address_string(), format % args)
 
     def _send_response(
@@ -109,8 +130,11 @@ class TelegramWebhookHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
-        if self.path == "/health":
+        if self.path in {"/", "/health"}:
             self._send_response(200, b"ok\n")
+            return
+        if self.path == "/favicon.ico":
+            self._send_response(204, b"", content_type="image/x-icon")
             return
         self._send_response(404, b"not found\n")
 
@@ -177,6 +201,47 @@ def cleanup_pending_urls(bot_data: dict) -> None:
     ]
     for token in expired_tokens:
         pending_urls.pop(token, None)
+
+
+def cleanup_media_cache(bot_data: dict) -> None:
+    media_cache = bot_data.setdefault(MEDIA_CACHE_KEY, {})
+    now = time.time()
+    expired_keys = [
+        cache_key for cache_key, payload in media_cache.items()
+        if now - payload.get("created_at", now) > MEDIA_CACHE_TTL_SECONDS
+    ]
+    for cache_key in expired_keys:
+        media_cache.pop(cache_key, None)
+
+
+def build_media_cache_key(url: str, media_kind: MediaKind) -> str:
+    return sha256(f"{media_kind}:{url}".encode("utf-8")).hexdigest()
+
+
+def get_cached_media(context: ContextTypes.DEFAULT_TYPE, url: str, media_kind: MediaKind) -> dict | None:
+    cleanup_media_cache(context.bot_data)
+    media_cache = context.bot_data.setdefault(MEDIA_CACHE_KEY, {})
+    return media_cache.get(build_media_cache_key(url, media_kind))
+
+
+def store_cached_media(
+    context: ContextTypes.DEFAULT_TYPE,
+    url: str,
+    media_kind: MediaKind,
+    payload: dict,
+) -> None:
+    cleanup_media_cache(context.bot_data)
+    media_cache = context.bot_data.setdefault(MEDIA_CACHE_KEY, {})
+    media_cache[build_media_cache_key(url, media_kind)] = {
+        **payload,
+        "created_at": time.time(),
+    }
+
+
+def invalidate_cached_media(context: ContextTypes.DEFAULT_TYPE, url: str, media_kind: MediaKind) -> None:
+    cleanup_media_cache(context.bot_data)
+    media_cache = context.bot_data.setdefault(MEDIA_CACHE_KEY, {})
+    media_cache.pop(build_media_cache_key(url, media_kind), None)
 
 
 def store_pending_url(context: ContextTypes.DEFAULT_TYPE, url: str) -> str:
@@ -276,7 +341,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def send_video(message: Message, url: str) -> None:
+async def send_video(message: Message, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
+    cached_media = get_cached_media(context, url, "video")
+    if cached_media:
+        try:
+            await message.reply_video(
+                video=cached_media["file_id"],
+                width=cached_media.get("width"),
+                height=cached_media.get("height"),
+                duration=cached_media.get("duration"),
+                supports_streaming=True,
+                read_timeout=120,
+                write_timeout=120,
+            )
+            return
+        except Exception as exc:
+            logger.warning("Cached video send failed, downloading again: %s", exc)
+            invalidate_cached_media(context, url, "video")
+
     status_msg = await message.reply_text("Скачиваю видео...")
     file_path = None
     temp_dir = None
@@ -299,7 +381,7 @@ async def send_video(message: Message, url: str) -> None:
         width, height, duration = probe_video_metadata(file_path)
         await status_msg.edit_text("Отправляю видео...")
         with open(file_path, "rb") as media_file:
-            await message.reply_video(
+            sent_message = await message.reply_video(
                 video=media_file,
                 width=width,
                 height=height,
@@ -307,6 +389,18 @@ async def send_video(message: Message, url: str) -> None:
                 supports_streaming=True,
                 read_timeout=120,
                 write_timeout=120,
+            )
+        if sent_message.video and sent_message.video.file_id:
+            store_cached_media(
+                context,
+                url,
+                "video",
+                {
+                    "file_id": sent_message.video.file_id,
+                    "width": width,
+                    "height": height,
+                    "duration": duration,
+                },
             )
         await status_msg.delete()
     except Exception as e:
@@ -317,7 +411,21 @@ async def send_video(message: Message, url: str) -> None:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-async def send_audio(message: Message, url: str) -> None:
+async def send_audio(message: Message, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
+    cached_media = get_cached_media(context, url, "audio")
+    if cached_media:
+        try:
+            await message.reply_audio(
+                audio=cached_media["file_id"],
+                title=cached_media.get("title"),
+                read_timeout=120,
+                write_timeout=120,
+            )
+            return
+        except Exception as exc:
+            logger.warning("Cached audio send failed, downloading again: %s", exc)
+            invalidate_cached_media(context, url, "audio")
+
     status_msg = await message.reply_text("Скачиваю аудио...")
     file_path = None
     temp_dir = None
@@ -340,11 +448,21 @@ async def send_audio(message: Message, url: str) -> None:
 
         await status_msg.edit_text("Отправляю аудио...")
         with open(file_path, "rb") as media_file:
-            await message.reply_audio(
+            sent_message = await message.reply_audio(
                 audio=media_file,
                 title=title[:64] if title else None,
                 read_timeout=120,
                 write_timeout=120,
+            )
+        if sent_message.audio and sent_message.audio.file_id:
+            store_cached_media(
+                context,
+                url,
+                "audio",
+                {
+                    "file_id": sent_message.audio.file_id,
+                    "title": title[:64] if title else None,
+                },
             )
         await status_msg.delete()
     except Exception as e:
@@ -381,7 +499,7 @@ async def handle_audio_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    await send_audio(update.message, url)
+    await send_audio(update.message, context, url)
 
 
 async def handle_video_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -393,7 +511,7 @@ async def handle_video_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    await send_video(update.message, url)
+    await send_video(update.message, context, url)
 
 
 async def handle_download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -421,9 +539,9 @@ async def handle_download_callback(update: Update, context: ContextTypes.DEFAULT
     await query.answer("Начинаю загрузку...")
 
     if media_kind == "audio":
-        await send_audio(query.message, url)
+        await send_audio(query.message, context, url)
     else:
-        await send_video(query.message, url)
+        await send_video(query.message, context, url)
 
 
 async def download_media(url: str, media_kind: MediaKind) -> tuple[str, str, str | None]:
@@ -436,7 +554,10 @@ async def download_media(url: str, media_kind: MediaKind) -> tuple[str, str, str
         "ignoreerrors": True,
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,
+        "noplaylist": True,
         "socket_timeout": 30,
+        "logger": SilentYTDLPLogger(),
     }
 
     if media_kind == "video":
